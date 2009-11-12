@@ -1,0 +1,566 @@
+Everything you never wanted to know about kobjects, ksets, and ktypes
+<TODO>
+
+Greg Kroah-Hartman <gregkh@suse.de>
+
+Based on an original article by Jon Corbet for lwn.net written October 1,
+2003 and located at http://lwn.net/Articles/51437/
+
+Last updated December 19, 2007
+本文以Jon Corbet于2003年10月1日发表于http://lwn.net/Articles/51437/的文
+
+章为基础. 最后更新于 2007年12月19日.
+
+Part of the difficulty in understanding the driver model - and the kobject
+abstraction upon which it is built - is that there is no obvious starting
+place. Dealing with kobjects requires understanding a few different types,
+all of which make reference to each other. In an attempt to make things
+easier, we'll take a multi-pass approach, starting with vague terms and
+adding detail as we go. To that end, here are some quick definitions of
+some terms we will be working with.
+<TODO>理解驱动模型以及它的基础kobject抽象层, 有一个难点就是 -- 不知道从何处入
+手. 想要搞懂kobject, 还必须理解其它几个数据类型, 因为它们互相交叉引用.
+为了简单起见, 我们采用muti-pass的方法, 从一些晦涩的术语开始, 逐个详细的
+去解释它们. 因此, 先简单的描述一下我们之后将要遇到的一些术语.
+
+ - A kobject is an object of type struct kobject.  Kobjects have a name
+   and a reference count.  A kobject also has a parent pointer (allowing
+   objects to be arranged into hierarchies), a specific type, and,
+   usually, a representation in the sysfs virtual filesystem.
+ - 一个kobject就是一个类型为struct kobject的对象, 它除了有名字和引用计数以
+   外, 还有一个父指针(parent pointer, 可以将多个对象按层次结构组织起来),
+   一个指定的类型, 另外, 通常情况下还有一个在sysfs虚拟文件系统中的
+   representation.<TODO>
+
+   Kobjects are generally not interesting on their own; instead, they are
+   usually embedded within some other structure which contains the stuff
+   the code is really interested in.
+   一般来说, kobject对自身并不感兴趣; 它们常常被嵌入到其它结构中, 这些结构
+   包含了代码真正感兴趣的东西.<TODO>
+
+   No structure should EVER have more than one kobject embedded within it.
+   If it does, the reference counting for the object is sure to be messed
+   up and incorrect, and your code will be buggy.  So do not do this.
+   无论什么样的结构都不应该嵌入多个kobject, 因为这会导致引用计数混乱,
+   让你的代码滋生bug. 所以, 千万不要这么做.
+
+ - A ktype is the type of object that embeds a kobject.  Every structure
+   that embeds a kobject needs a corresponding ktype.  The ktype controls
+   what happens to the kobject when it is created and destroyed.
+ - <TODO>...每一个嵌入了kobject的结构, 都需要一个与之关联的ktype. ktype用来控制
+   创建和销毁kobject时的行为.
+
+ - A kset is a group of kobjects.  These kobjects can be of the same ktype
+   or belong to different ktypes.  The kset is the basic container type for
+   collections of kobjects. Ksets contain their own kobjects, but you can
+   safely ignore that implementation detail as the kset core code handles
+   this kobject automatically.
+ - 一个kset是指一组kobject, 这一组kobject可以属于同一个ktype, 也可以分属于
+   不同的ktype. kset是容纳kobject的最基本的容器类型. Kset也包含了它自有的
+   kobject, 这部分的细节你完全可以忽略, 因为kset的核心代码会自动处理它自己
+   的kobject.
+
+   When you see a sysfs directory full of other directories, generally each
+   of those directories corresponds to a kobject in the same kset.
+   当你发现sysfs某个目录下塞满了其它目录时, 一般来说, 它们中的每一个目录都
+   对应于属于同一个kset的某个kobject.
+
+We'll look at how to create and manipulate all of these types. A bottom-up
+approach will be taken, so we'll go back to kobjects.
+我们将采用自底向上的方法来看看如何创建和维护上面提到的这些类型. 所以,
+让我们从kobject开始.
+
+Embedding kobjects
+嵌入kobject
+
+It is rare for kernel code to create a standalone kobject, with one major
+exception explained below.  Instead, kobjects are used to control access to
+a larger, domain-specific object.  To this end, kobjects will be found
+embedded in other structures.  If you are used to thinking of things in
+object-oriented terms, kobjects can be seen as a top-level, abstract class
+from which other classes are derived.  A kobject implements a set of
+capabilities which are not particularly useful by themselves, but which are
+nice to have in other objects.  The C language does not allow for the
+direct expression of inheritance, so other techniques - such as structure
+embedding - must be used.
+内核几乎不会创建一个单独的kobject, 但是有一个重要的例外, 稍后我们会解释.
+相反, kobject用来对一些大型的, 用于特定领域的对象进行访问控制. 为此, 我
+们会发现kobject被嵌入到了其它结构中. 如果你习惯用面向对象的方法考虑问题,
+kobject可以被认为是处于最顶层的基类, 而其它类都由其派生. Kobject实现了
+一系列不太被它们自己所使用, 而对于其他对象来说则是非常有用的功能. C语言
+里面不能够直接描述继承关系, 所以必须使用一些其它技巧, 比如在结构中嵌入
+另外一个结构.
+
+So, for example, the UIO code has a structure that defines the memory
+region associated with a uio device:
+我们来看一个例子, UIO的代码里面, 定义了一个结构用来描述与uio device关联
+的一段内存区域:
+
+struct uio_mem {
+	struct kobject kobj;
+	unsigned long addr;
+	unsigned long size;
+	int memtype;
+	void __iomem *internal_addr;
+};
+
+If you have a struct uio_mem structure, finding its embedded kobject is
+just a matter of using the kobj member.  Code that works with kobjects will
+often have the opposite problem, however: given a struct kobject pointer,
+what is the pointer to the containing structure?  You must avoid tricks
+(such as assuming that the kobject is at the beginning of the structure)
+and, instead, use the container_of() macro, found in <linux/kernel.h>:
+如果你有一个struct uio_mem这样的结构, 找出嵌入其中的kobject就是直接使用
+kobj这个成员. 然而实际写代码时, 我们往往会遇到一个相反的问题: 对于给定
+的kobject指针, 如何找出那个包含它的结构来呢? 你最好不要用一些奇技淫巧
+(比如假定kobject存放在结构的最开始处), 而要用内核提供的container_off()
+宏, 定义在<linux/kernel.h>中:
+
+	container_of(pointer, type, member)
+
+where pointer is the pointer to the embedded kobject, type is the type of
+the containing structure, and member is the name of the structure field to
+which pointer points.  The return value from container_of() is a pointer to
+the given type. So, for example, a pointer "kp" to a struct kobject
+embedded within a struct uio_mem could be converted to a pointer to the
+containing uio_mem structure with:
+pointer是指向被嵌入的kobject的指针, type是包含kobject的结构的类型, 而
+member就是...... <TODO>container_off返回一个type类型的指针. 比如: 我们有一个
+指针"kp", 指向嵌入在结构struct uio_mem中的kobject, 那么可以用下面的办法
+可以通过kp获得指向struct uio_mem的指针:
+
+    struct uio_mem *u_mem = container_of(kp, struct uio_mem, kobj);
+
+Programmers often define a simple macro for "back-casting" kobject pointers
+to the containing type.
+程序员们往往会定义更简单的宏来实现通过kobject的指针来获得其容器的指针.
+
+Initialization of kobjects
+初始化kobject
+
+Code which creates a kobject must, of course, initialize that object. Some
+of the internal fields are setup with a (mandatory) call to kobject_init():
+创建kobject的代码显然也必须对它进行初始化. Kobject的一些内部成员必须通
+过函数kobject_init()进行设置:
+
+    void kobject_init(struct kobject *kobj, struct kobj_type *ktype);
+
+The ktype is required for a kobject to be created properly, as every kobject
+must have an associated kobj_type.  After calling kobject_init(), to
+register the kobject with sysfs, the function kobject_add() must be called:
+要正确创建kobject, ktype是必须的, 因为每一个kobject都必须有一个与之关联
+的kobj_type. kobject_init()执行完毕之后, 为了把kobject注册到sysfs, 函数
+kobject_add()必须被调用:
+
+    int kobject_add(struct kobject *kobj, struct kobject *parent, const char *fmt, ...);
+
+This sets up the parent of the kobject and the name for the kobject
+properly.  If the kobject is to be associated with a specific kset,
+kobj->kset must be assigned before calling kobject_add().  If a kset is
+associated with a kobject, then the parent for the kobject can be set to
+NULL in the call to kobject_add() and then the kobject's parent will be the
+kset itself.
+这一步会设置kobject的parent和名字, 如果该kobject将于一个特定的kset关联,
+则kobj->kset必须在调用kobjetc_add()之前被赋值. 如果一个kobject已经与一
+个kset关联了, 那么它的parent可以被赋为NULL, 这样这个kobject的parent就会
+是kset自身.
+
+As the name of the kobject is set when it is added to the kernel, the name
+of the kobject should never be manipulated directly.  If you must change
+the name of the kobject, call kobject_rename():
+因为在调用kobject_add()将kobject加入到内核时, 名字就已经被指定了, 所以
+之后你觉不要直接去修改kobject的名字. 当然如果你一定要改, 请使用
+kobject_rename()函数:
+
+    int kobject_rename(struct kobject *kobj, const char *new_name);
+
+kobject_rename does not perform any locking or have a solid notion of
+what names are valid so the caller must provide their own sanity checking
+and serialization.
+kobject_rename()函数本身不会使用任何锁机制, 也没有可靠的办法来判断你传
+递给它的名字是有效的, 所以调用者必须自己检查参数的有效性, 和保证程序执
+行的顺序.
+
+There is a function called kobject_set_name() but that is legacy cruft and
+is being removed.  If your code needs to call this function, it is
+incorrect and needs to be fixed.
+还有一个类似的函数kobject_set_name(), 不过它现在只是个历史遗留物, 并且
+将会被移出内核代码. 如果你的代码需要使用这个函数, 显然是不正确的, 必须
+修正.
+
+To properly access the name of the kobject, use the function
+kobject_name():
+正确获取kobject的名字的办法是使用函数kobject_name():
+
+    const char *kobject_name(const struct kobject * kobj);
+
+There is a helper function to both initialize and add the kobject to the
+kernel at the same time, called surprisingly enough kobject_init_and_add():
+辅助函数kobject_init_and_add()可以在同时完成初始化和将kobject增加至内核:
+
+    int kobject_init_and_add(struct kobject *kobj, struct kobj_type *ktype,
+                             struct kobject *parent, const char *fmt, ...);
+
+The arguments are the same as the individual kobject_init() and
+kobject_add() functions described above.
+所需要的参数跟分别调用kobject_init()和kobject_add()是一样的.
+
+Uevents
+Uevents
+
+After a kobject has been registered with the kobject core, you need to
+announce to the world that it has been created.  This can be done with a
+call to kobject_uevent():
+当你将一个kobject对象注册到kobject核心后, 有必要向全世界宣布一下它被创
+建的消息. 这个过程由kobject_uevent()函数来完成:
+
+    int kobject_uevent(struct kobject *kobj, enum kobject_action action);
+
+Use the KOBJ_ADD action for when the kobject is first added to the kernel.
+This should be done only after any attributes or children of the kobject
+have been initialized properly, as userspace will instantly start to look
+for them when this call happens.
+当一个kobject第一次被加入到内核时, 使用KOBJ_ADD action. 这一步必须是在
+任意attributes或者一个kobject对象的孩子被正确的初始化后来做, 这样用户空
+间的程序就可以立即开始检测它们.
+
+When the kobject is removed from the kernel (details on how to do that is
+below), the uevent for KOBJ_REMOVE will be automatically created by the
+kobject core, so the caller does not have to worry about doing that by
+hand.
+当一个kobject对象从内核被移出的的是很(如何完成这步下文将会说明),
+KOBJ_REMOVE 事件将会由kobject的核心代码自动创建, 所以你无须担心这一步必
+须由你手动完成.
+
+
+Reference counts
+引用计数
+
+One of the key functions of a kobject is to serve as a reference counter
+for the object in which it is embedded. As long as references to the object
+exist, the object (and the code which supports it) must continue to exist.
+The low-level functions for manipulating a kobject's reference counts are:
+kobject的一个关键的功能就是为那些包含它的对象来处理引用计数. 只要一个对
+象的引用计数存在, 那么对象本身(以及支持它的代码)都必须继续存在. 维护
+kobject引用技术的底层函数是:
+
+    struct kobject *kobject_get(struct kobject *kobj);
+    void kobject_put(struct kobject *kobj);
+
+A successful call to kobject_get() will increment the kobject's reference
+counter and return the pointer to the kobject.
+调用kobject_get()成功后, 将会增加kobject对象的引用技术, 并返回指向该
+kobject对象的指针.
+
+When a reference is released, the call to kobject_put() will decrement the
+reference count and, possibly, free the object. Note that kobject_init()
+sets the reference count to one, so the code which sets up the kobject will
+need to do a kobject_put() eventually to release that reference.
+当释放一次引用时, 调用函数kobject_put()将减少引用计数, 并且如果可能, 会
+释放该对象. 注意, kobject_init()会将引用技术设置为1, 所以如果你的代码初
+始化过一个kobject对象, 那么在最后必须使用kobject_put()来释放它.
+
+Because kobjects are dynamic, they must not be declared statically or on
+the stack, but instead, always allocated dynamically.  Future versions of
+the kernel will contain a run-time check for kobjects that are created
+statically and will warn the developer of this improper usage.
+因为kobject应该是动态的, 所以它不应该被声明为static, 或者定义在stack内,
+而必须动态非配. 在内核未来的版本中会引入运行时检测: 如果kobject是静态创
+建的, 将会发出警告以提醒开发者这样使用是不对的.
+
+If all that you want to use a kobject for is to provide a reference counter
+for your structure, please use the struct kref instead; a kobject would be
+overkill.  For more information on how to use struct kref, please see the
+file Documentation/kref.txt in the Linux kernel source tree.
+如果你使用kobject仅仅为了引用计数, 那实在是大材小用.建议你用kref结构来
+代替. 关于kref结构的详细信息, 请参考Linux内核源代码目录下的
+Documentation/kref.txt.
+
+
+Creating "simple" kobjects
+创建"简单的"kobject对象
+
+Sometimes all that a developer wants is a way to create a simple directory
+in the sysfs hierarchy, and not have to mess with the whole complication of
+ksets, show and store functions, and other details.  This is the one
+exception where a single kobject should be created.  To create such an
+entry, use the function:
+有时候, 开发者仅仅只是想在sysfs下创建一个目录, 而不想跟kset, show和
+store函数等等这些复杂的概念打交道. 这是一种特殊情况: 它需要创建一个独立
+的kobject对象. 可以用这个函数来实现这一点:
+
+    struct kobject *kobject_create_and_add(char *name, struct kobject *parent);
+
+This function will create a kobject and place it in sysfs in the location
+underneath the specified parent kobject.  To create simple attributes
+associated with this kobject, use:
+这个函数会创建一个kobject对象, 并放在sysfs之中指定的父对象之下. 要创建
+一些简单的attributes与这个kobject对象关联, 可以使用下面的函数:
+
+    int sysfs_create_file(struct kobject *kobj, struct attribute *attr);
+or
+    int sysfs_create_group(struct kobject *kobj, struct attribute_group *grp);
+
+Both types of attributes used here, with a kobject that has been created
+with the kobject_create_and_add(), can be of type kobj_attribute, so no
+special custom attribute is needed to be created.
+<TODO>
+
+See the example module, samples/kobject/kobject-example.c for an
+implementation of a simple kobject and attributes.
+关于实现简单的kobject对象和attributes, 可以参考例子:samples/kobject/kobject-example.c
+
+
+ktypes and release methods
+ktype和release方法
+
+One important thing still missing from the discussion is what happens to a
+kobject when its reference count reaches zero. The code which created the
+kobject generally does not know when that will happen; if it did, there
+would be little point in using a kobject in the first place. Even
+predictable object lifecycles become more complicated when sysfs is brought
+in as other portions of the kernel can get a reference on any kobject that
+is registered in the system.
+一个非常重要的问题至今我们还没有讨论, 那就是当一个kobject对象的引用计数
+降到0后会发生什么. 创建kobject对象的代码一般情况下无法得知kobject何时引
+用计数会变成0; <TODO>
+
+The end result is that a structure protected by a kobject cannot be freed
+before its reference count goes to zero. The reference count is not under
+the direct control of the code which created the kobject. So that code must
+be notified asynchronously whenever the last reference to one of its
+kobjects goes away.
+最终结果是, 由kobject保护的结构在kobject的引用计数为0之前不能够被释放.
+而引用计数又不在创建kobject的代码的直接控制之下. 所以代码创建的某一个
+kobject对象的最后一个引用计数被减掉时它必须得到一个异步的通知.
+
+Once you registered your kobject via kobject_add(), you must never use
+kfree() to free it directly. The only safe way is to use kobject_put(). It
+is good practice to always use kobject_put() after kobject_init() to avoid
+errors creeping in.
+一旦你使用kobject_add()注册了一个kobject对象, 你决不能直接使用kfree将其
+释放. 唯一安全的办法是使用kobject_put(). 避免错误悄悄混入的良好习惯就是
+在kobject_init()之后, 总是使用kobject_put()来释放对象.
+
+This notification is done through a kobject's release() method. Usually
+such a method has a form like:
+异步通知的功能有kobject的release()方法实现, 通常情况下它看起来就想下面
+这个函数一样:
+
+    void my_object_release(struct kobject *kobj)
+    {
+    	    struct my_object *mine = container_of(kobj, struct my_object, kobj);
+
+	    /* Perform any additional cleanup on this object, then... */
+	    kfree(mine);
+    }
+
+One important point cannot be overstated: every kobject must have a
+release() method, and the kobject must persist (in a consistent state)
+until that method is called. If these constraints are not met, the code is
+flawed.  Note that the kernel will warn you if you forget to provide a
+release() method.  Do not try to get rid of this warning by providing an
+"empty" release function; you will be mocked mercilessly by the kobject
+maintainer if you attempt this.
+一个怎么强调也不会过分的要点是: 每个kobject对象必须有一个release()方法,
+并且kobject必须保持状态一致直到这个方法被调用. 如果没有实现这个约束, 那
+代码就是有缺陷的. 注意内核会警告你如果你忘记提供一个release()方法. 不要
+尝试去提供一个"空的"release函数来回避这个警告; 如果你企图这么做,
+kobject的维护者会无情的嘲笑你.
+
+Note, the name of the kobject is available in the release function, but it
+must NOT be changed within this callback.  Otherwise there will be a memory
+leak in the kobject core, which makes people unhappy.
+注意, kobject的名字在release函数中是可以访问的, 但是它在这个回调函数中
+绝对*不可以*被修改. 否则会在kobject核心代码中造成另大家都很不愉快的内存
+泄露.
+
+Interestingly, the release() method is not stored in the kobject itself;
+instead, it is associated with the ktype. So let us introduce struct
+kobj_type:
+有意思的是, release()方法并不是由kobject本身来保存; 而是由与之关联的
+ktype保存. 所以让我们来介绍一下struct kobj_type:
+
+    struct kobj_type {
+	    void (*release)(struct kobject *);
+	    struct sysfs_ops	*sysfs_ops;
+	    struct attribute	**default_attrs;
+    };
+
+This structure is used to describe a particular type of kobject (or, more
+correctly, of containing object). Every kobject needs to have an associated
+kobj_type structure; a pointer to that structure must be specified when you
+call kobject_init() or kobject_init_and_add().
+该结构被用来描述某一特定类型的kobject对象(或者, 更准确的说, 包含
+kobject的对象). 每一个kobject对象必须与一个kobj_type结构关联; 当你调用
+kobject_init()或者kobject_init_and_add()时, 必须指定一个指向kobj_type结
+构的指针.
+
+The release field in struct kobj_type is, of course, a pointer to the
+release() method for this type of kobject. The other two fields (sysfs_ops
+and default_attrs) control how objects of this type are represented in
+sysfs; they are beyond the scope of this document.
+kobj_type中的release成员, 当然就是指向该类型kobject对象release方法的函
+数指针. 另外2个成员(sysfs_ops和default_attrs)用来控制对象如何在sysfs中
+显示;关于它们的详细内容, 不在本文档的讨论范围之内.
+
+The default_attrs pointer is a list of default attributes that will be
+automatically created for any kobject that is registered with this ktype.
+default_attrs指针指向一个default attributes列表, 该表会在kobject与
+ktype一起注册时自动创建.
+
+
+ksets
+ksets
+
+A kset is merely a collection of kobjects that want to be associated with
+each other.  There is no restriction that they be of the same ktype, but be
+very careful if they are not.
+一个kset只不过是一个容器, 用来收集一些互相关联的kobject对象. 虽然属于同
+一个kset的多个kobject对象的ktype并不一定非要相同, 不过如果它们真的不同,
+你还是需要小心.
+
+A kset serves these functions:
+一个Kset提供如下几个功能:
+
+ - It serves as a bag containing a group of objects. A kset can be used by
+   the kernel to track "all block devices" or "all PCI device drivers."
+ - 它像一个袋子一样可以装下一组对象. 内核可以使用kset来遍历"所有的块设
+   备"或者"所有的PCI设备驱动"等.
+
+ - A kset is also a subdirectory in sysfs, where the associated kobjects
+   with the kset can show up.  Every kset contains a kobject which can be
+   set up to be the parent of other kobjects; the top-level directories of
+   the sysfs hierarchy are constructed in this way.
+ - 一个kset也是一个sysfs子目录, 与之关联的kobjects对象可以显示在其中. 每一
+   个kset同时也包含一个kobject, 该对象可以被设置为其它kobject对象的父亲.
+    sysfs层次结构的最顶层目录就是以这样的方式构成的.
+
+ - Ksets can support the "hotplugging" of kobjects and influence how
+   uevent events are reported to user space.
+ - Kset支持kobject对象的"热拔插", 并且可以影响uevent事件是如何被报告到
+   用户空间的.
+
+In object-oriented terms, "kset" is the top-level container class; ksets
+contain their own kobject, but that kobject is managed by the kset code and
+should not be manipulated by any other user.
+用面向对象的观点来看, "kset" 是位于最顶层的容器类; kset包含属于它自己的
+kobject对象, 但是该kobject对象由kset核心代码来管理, 而不是由其它使用者
+来操纵.
+
+A kset keeps its children in a standard kernel linked list.  Kobjects point
+back to their containing kset via their kset field. In almost all cases,
+the kobjects belonging to a kset have that kset (or, strictly, its embedded
+kobject) in their parent.
+kset用将自己的孩子们保存在标准的内核链表中. 每个kobject对象可以通过自己
+的kset成员指回包含自己的kset. 绝大多数情况下, 属于某个kset的kobject对象,
+其父亲就是该kset(或者, 严格的说, 是该kset内的kobject).
+
+As a kset contains a kobject within it, it should always be dynamically
+created and never declared statically or on the stack.  To create a new
+kset use:
+正因为kset自身也包含了一个kobject对象, 所以它应该是动态创建的, 而不应该
+定义为static或者定义在栈上. 创建一个新的kset, 使用:
+  struct kset *kset_create_and_add(const char *name,
+				   struct kset_uevent_ops *u,
+				   struct kobject *parent);
+
+When you are finished with the kset, call:
+当你不需要再使用一个kset时, 使用该函数来销毁它.
+  void kset_unregister(struct kset *kset);
+to destroy it.
+
+An example of using a kset can be seen in the
+samples/kobject/kset-example.c file in the kernel tree.
+使用kset的一个例子可以在内核源代码目录下找
+到:samples/kobject/kset-example.c
+
+If a kset wishes to control the uevent operations of the kobjects
+associated with it, it can use the struct kset_uevent_ops to handle it:
+如果kset期望控制那些与之关联的kobject对象的uevent事件, 可以使用struct
+kset_uevent_ops来处理:
+
+struct kset_uevent_ops {
+        int (*filter)(struct kset *kset, struct kobject *kobj);
+        const char *(*name)(struct kset *kset, struct kobject *kobj);
+        int (*uevent)(struct kset *kset, struct kobject *kobj,
+                      struct kobj_uevent_env *env);
+};
+
+
+The filter function allows a kset to prevent a uevent from being emitted to
+userspace for a specific kobject.  If the function returns 0, the uevent
+will not be emitted.
+filter函数让kset可以阻止某个指定的kobject对象的uevent事件被发送到用户空
+间. 如果该函数返回0, 那uevent事件就不会被发送.
+
+The name function will be called to override the default name of the kset
+that the uevent sends to userspace.  By default, the name will be the same
+as the kset itself, but this function, if present, can override that name.
+name函数用来覆盖kset默认的被uevent发送到用户空间的名字. 默认情况下, 通
+过uevent发送的名字于kset自身的名字一致, 但是如果该name函数存在, 则可以
+用一个新名字覆盖.
+
+The uevent function will be called when the uevent is about to be sent to
+userspace to allow more environment variables to be added to the uevent.
+当uevent事件将要被发送到用户空间之前, uevent函数可以允许更多的环境变量
+被添加到uevent事件中.
+
+One might ask how, exactly, a kobject is added to a kset, given that no
+functions which perform that function have been presented.  The answer is
+that this task is handled by kobject_add().  When a kobject is passed to
+kobject_add(), its kset member should point to the kset to which the
+kobject will belong.  kobject_add() will handle the rest.
+有人可能会问, 到底一个kobject对象是如何加入到一个kset中的, 给出的函数中,
+没有能过完成此功能的. 答案是这个任务有kobject_add()函数来处理. 当一个
+kobject对象做参数传递给kobject_add()函数时, 它的kset成员应该指向那个将
+要包含自己的kset. 剩下的事情, kobjetct_add()会处理.
+
+If the kobject belonging to a kset has no parent kobject set, it will be
+added to the kset's directory.  Not all members of a kset do necessarily
+live in the kset directory.  If an explicit parent kobject is assigned
+before the kobject is added, the kobject is registered with the kset, but
+added below the parent kobject.
+属于某个特定kset的kobject对象如果没有指定自己的父亲, 那它会被加入到这个
+kset的目录. 属于某个kset的所有kobject对象并非一定都要活在该kset的目录下.
+如果kobject对象被加入到内核之前, 已经明确指定了自己的父亲, 那么虽然该
+kobject对象会注册到某个kset, 但是其也会被加入到其父对象之中.
+
+
+Kobject removal
+移除kobject对象
+
+After a kobject has been registered with the kobject core successfully, it
+must be cleaned up when the code is finished with it.  To do that, call
+kobject_put().  By doing this, the kobject core will automatically clean up
+all of the memory allocated by this kobject.  If a KOBJ_ADD uevent has been
+sent for the object, a corresponding KOBJ_REMOVE uevent will be sent, and
+any other sysfs housekeeping will be handled for the caller properly.
+一个kobject对象成功的注册到了kobject核心代码之后, 如果代码已经不需要再
+使用它. 那它必须被清除. 使用函数kobject_put()来完成清除任务. 通过调用这
+个函数, kobject核心代码会自动释放所有该对象申请的内存. 如果KOBJ_ADD
+uevent事件被发送过, 那么与之对应的KOBJ_REMOVE uevent事件也会被发送....<TODO>
+
+If you need to do a two-stage delete of the kobject (say you are not
+allowed to sleep when you need to destroy the object), then call
+kobject_del() which will unregister the kobject from sysfs.  This makes the
+kobject "invisible", but it is not cleaned up, and the reference count of
+the object is still the same.  At a later time call kobject_put() to finish
+the cleanup of the memory associated with the kobject.
+如果你需要分2步来删除一个kobject对象(即你的代码处在一个不允许进入睡眠的
+环境中, 但你又确实需要删除该对象), 那么调用kobject_del()函数, 将
+kobject对象从sysfs中注销. 这一步将使得kobject"不可见", 但它并没有被释放,
+并且引用计数保持不变. 之后, 再调用kobject_put()来释放所有kobject申请的
+内存.
+
+kobject_del() can be used to drop the reference to the parent object, if
+circular references are constructed.  It is valid in some cases, that a
+parent objects references a child.  Circular references _must_ be broken
+with an explicit call to kobject_del(), so that a release functions will be
+called, and the objects in the former circle release each other.
+<TODO>
+
+Example code to copy from
+
+For a more complete example of using ksets and kobjects properly, see the
+sample/kobject/kset-example.c code.
