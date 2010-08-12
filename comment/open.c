@@ -46,6 +46,7 @@ struct files_struct {
   /*
    * read mostly part
    */
+	/* 应用计数, 可能有多个进程使用当前的files结构 */
 	atomic_t count;
 	/* 
 	 * 这样的声明很奇怪, 要一个fdtable指针, 还要一个fdtable变量...
@@ -190,7 +191,7 @@ repeat:
 	 * 离fd最近的, 大于或等于fd, 没有被使用的fd.
 	 * open_fds 其实就是一个fd_set, 用过select的同学一定熟悉.
 	 * fds_bits就是一组bit位, 0表示未使用, 1表示已经使用.
-	 * max_fds大家都知道默认是1024, 但是可以扩展.
+	 * max_fds默认是BITS_PER_LONG, 但是可以扩展.
 	 */
 	if (fd < fdt->max_fds)
 		fd = find_next_zero_bit(fdt->open_fds->fds_bits,
