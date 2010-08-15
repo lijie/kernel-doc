@@ -237,3 +237,465 @@ out:
 	spin_unlock(&files->file_lock);
 	return error;
 }
+
+
+/* --- 查找文件 --- */
+
+/* --- 数据结构 --- */
+
+/* 这个是VFS中最为重要的数据结构之一,
+ * dentry, 一般称之位dentry cache或者dcache, 它的结构比较复杂,
+ * 保存的数据很多, 作用也用多, 但是它有几个特点:
+ * dentry完全保存在内存中, 不会写入磁盘.
+ * dentry的存在完全是为了提高性能, 它cache了很多数据,
+ * 比如某个目录的dcache, 保存了它的父目录, (部分)子目录, 对应的inode结构,
+ * 并且提供hash来实现快速查找.
+ * 总之目前我们可以这么认为: 查找某个文件, 就是找这个文件的dcache. */
+struct dentry dentry;
+
+/* quick string
+ * 该结构在内核中用来表达一个文件或者目录的名字,
+ * 根据pathname找着文件时, 为了提高查询效率,
+ * 内核使用到了hash.
+ */
+struct qstr {
+	/* 字符串hash后的值 */
+	unsigned int hash;
+	/* 字符串的实际长度 */
+	unsigned int len;
+	/* 真正的字符串本身 */
+	const unsigned char *name;
+};
+
+/* path就是表示某个文件的路径了,
+ * 其实拿到dentry后, 就已经可以知道当前文件的完整路径了,
+ * 但是dentry本身是VFS里面的概念, 与具体的文件系统无直接
+ * 关系, 所以它并没有保存文件所在的挂载点的信息, 比如
+ * 当前文件使用的哪种文件系统等等. 
+ * path将二者组合起来,方便使用.
+ */
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
+};
+
+/* 这个结构怎么说呢...
+ * 我们在根据pathname寻找dcache的过程中, 会用到下面一些数据,
+ * 于是把这些数据组织起来, 就叫nameidata了... */
+struct nameidata {
+	struct path	path;
+	struct qstr	last;
+	struct path	root;
+	unsigned int	flags;
+	int		last_type;
+	unsigned	depth;
+	char *saved_names[MAX_NESTED_LINKS + 1];
+
+	/* Intent data */
+	union {
+		struct open_intent open;
+	} intent;
+};
+
+/*
+ * Note that the low bits of the passed in "open_flag"
+ * are not the same as in the local variable "flag". See
+ * open_to_namei_flags() for more details.
+ */
+struct file *do_filp_open(int dfd, const char *pathname,
+		int open_flag, int mode, int acc_mode)
+{
+	struct file *filp;
+	struct nameidata nd;
+	int error;
+	struct path path;
+	int count = 0;
+	int flag = open_to_namei_flags(open_flag);
+	int force_reval = 0;
+
+	if (!(open_flag & O_CREAT))
+		mode = 0;
+
+	/*
+	 * O_SYNC is implemented as __O_SYNC|O_DSYNC.  As many places only
+	 * check for O_DSYNC if the need any syncing at all we enforce it's
+	 * always set instead of having to deal with possibly weird behaviour
+	 * for malicious applications setting only __O_SYNC.
+	 */
+	if (open_flag & __O_SYNC)
+		open_flag |= O_DSYNC;
+
+	if (!acc_mode)
+		acc_mode = MAY_OPEN | ACC_MODE(open_flag);
+
+	/* O_TRUNC implies we need access checks for write permissions */
+	if (open_flag & O_TRUNC)
+		acc_mode |= MAY_WRITE;
+
+	/* Allow the LSM permission hook to distinguish append 
+	   access from general write access. */
+	if (open_flag & O_APPEND)
+		acc_mode |= MAY_APPEND;
+
+	/* find the parent */
+	/* 在开始查找之前, 初始化一下nameidata,
+	 * 话说这函数名居然叫path_init, 不是很地道啊...
+	 * 根据pathname使用的是绝对路径还是相对路径,
+	 * nd.path = current->fs->root 或者 current->fs->pwd
+	 *
+	 * 这里我说下我的看法, 未经验证的:
+	 * 内核必须保证有2个dcache必须在内存里面,
+	 * 1 是根目录, 2 是当前进程的pwd.
+	 * 所以这一步可以说是确定我们的开始位置, 然后再开始查找工作.
+	 *
+	 * LOOKUP_PARENT 的意思是我们要找到target的parent,
+	 * 比如这个目录: /path/to/your/file,
+	 * 我们想找的是'your'.
+	 */
+reval:
+	error = path_init(dfd, pathname, LOOKUP_PARENT, &nd);
+	if (error)
+		return ERR_PTR(error);
+	if (force_reval)
+		nd.flags |= LOOKUP_REVAL;
+
+	current->total_link_count = 0;
+
+	/* link_path_walk在这里完成的任务比较纠结
+	 * 以/path/to/your/file这个pathname作为例子的话,
+	 * 最终nd->path将会保存'your'的dcache,
+	 * nd->last.name将会指向file这个字符串,
+	 * 就是说, 我们现在拿到了parent的dcache,
+	 * 和目标文件的qstr */
+	error = link_path_walk(pathname, &nd);
+	if (error) {
+		filp = ERR_PTR(error);
+		goto out;
+	}
+	/* ??? */
+	if (unlikely(!audit_dummy_context()) && (open_flag & O_CREAT))
+		audit_inode(pathname, nd.path.dentry);
+
+	/*
+	 * We have the parent and last component.
+	 */
+
+	error = -ENFILE;
+	/* 分配一个空的struct file */
+	filp = get_empty_filp();
+	if (filp == NULL)
+		goto exit_parent;
+	nd.intent.open.file = filp;
+	/* 记录open传进来的flags */
+	filp->f_flags = open_flag;
+	nd.intent.open.flags = flag;
+	nd.intent.open.create_mode = mode;
+	/* 清除掉PARENT标志位, 加上OPEN标志位 */
+	nd.flags &= ~LOOKUP_PARENT;
+	nd.flags |= LOOKUP_OPEN;
+	/* 如果需要, 加上CREAT标志位 */
+	if (open_flag & O_CREAT) {
+		nd.flags |= LOOKUP_CREATE;
+		if (open_flag & O_EXCL)
+			nd.flags |= LOOKUP_EXCL;
+	}
+	if (open_flag & O_DIRECTORY)
+		nd.flags |= LOOKUP_DIRECTORY;
+	if (!(open_flag & O_NOFOLLOW))
+		nd.flags |= LOOKUP_FOLLOW;
+	/* do_last么, 你可以看作是最后一步, 但是这一步可够繁琐的... */
+	filp = do_last(&nd, &path, open_flag, acc_mode, mode, pathname);
+	/*
+	 * filp == NULL 说明我们要打开的文件是个符号链接,
+	 */
+	while (unlikely(!filp)) { /* trailing symlink */
+		struct path holder;
+		struct inode *inode = path.dentry->d_inode;
+		void *cookie;
+		error = -ELOOP;
+		/* S_ISDIR part is a temporary automount kludge */
+		if (!(nd.flags & LOOKUP_FOLLOW) && !S_ISDIR(inode->i_mode))
+			goto exit_dput;
+		if (count++ == 32)
+			goto exit_dput;
+		/*
+		 * This is subtle. Instead of calling do_follow_link() we do
+		 * the thing by hands. The reason is that this way we have zero
+		 * link_count and path_walk() (called from ->follow_link)
+		 * honoring LOOKUP_PARENT.  After that we have the parent and
+		 * last component, i.e. we are in the same situation as after
+		 * the first path_walk().  Well, almost - if the last component
+		 * is normal we get its copy stored in nd->last.name and we will
+		 * have to putname() it when we are done. Procfs-like symlinks
+		 * just set LAST_BIND.
+		 */
+		nd.flags |= LOOKUP_PARENT;
+		error = security_inode_follow_link(path.dentry, &nd);
+		if (error)
+			goto exit_dput;
+		error = __do_follow_link(&path, &nd, &cookie);
+		if (unlikely(error)) {
+			/* nd.path had been dropped */
+			if (!IS_ERR(cookie) && inode->i_op->put_link)
+				inode->i_op->put_link(path.dentry, &nd, cookie);
+			path_put(&path);
+			release_open_intent(&nd);
+			filp = ERR_PTR(error);
+			goto out;
+		}
+		holder = path;
+		nd.flags &= ~LOOKUP_PARENT;
+		filp = do_last(&nd, &path, open_flag, acc_mode, mode, pathname);
+		if (inode->i_op->put_link)
+			inode->i_op->put_link(holder.dentry, &nd, cookie);
+		path_put(&holder);
+	}
+out:
+	if (nd.root.mnt)
+		path_put(&nd.root);
+	if (filp == ERR_PTR(-ESTALE) && !force_reval) {
+		force_reval = 1;
+		goto reval;
+	}
+	return filp;
+
+exit_dput:
+	path_put_conditional(&path, &nd);
+	if (!IS_ERR(nd.intent.open.file))
+		release_open_intent(&nd);
+exit_parent:
+	path_put(&nd.path);
+	filp = ERR_PTR(error);
+	goto out;
+}
+
+/* 
+ * nd 保存了我们目标文件的parent, 以及打开目标文件的一些flags等等
+ * path 找到目标文件的dcache后, 保存在path中.
+ * 所谓do_last, last指的是/path/to/your/file中的file.
+ */
+static struct file *do_last(struct nameidata *nd, struct path *path,
+			    int open_flag, int acc_mode,
+			    int mode, const char *pathname)
+{
+	struct dentry *dir = nd->path.dentry;
+	struct file *filp;
+	int error = -EISDIR;
+
+	/* last_type是指我们要处理的的文件的类型 */
+	switch (nd->last_type) {
+		/* 如果last是"..", 那我们要的target其实就是nd->path.dentry,
+		 * 所以我么现在要找parent的parent... */
+	case LAST_DOTDOT:
+		follow_dotdot(nd);
+		dir = nd->path.dentry;
+	case LAST_DOT:
+		/* ??? */
+		if (nd->path.mnt->mnt_sb->s_type->fs_flags & FS_REVAL_DOT) {
+			if (!dir->d_op->d_revalidate(dir, nd)) {
+				error = -ESTALE;
+				goto exit;
+			}
+		}
+		/* fallthrough */
+	case LAST_ROOT:
+		/* 如果last是根目录, 我们不允许创建, 也就是说,
+		 * 根目录是不可能通过open来创建的... */
+		if (open_flag & O_CREAT)
+			goto exit;
+		/* fallthrough */
+	case LAST_BIND:
+		/* ??? */
+		audit_inode(pathname, dir);
+		goto ok;
+	}
+
+	/* trailing slashes? */
+	/* Target可能是个目录或者符号链接 */
+	if (nd->last.name[nd->last.len]) {
+		/* 看起来, open不允许被用来创建目录啊... */
+		if (open_flag & O_CREAT)
+			goto exit;
+		nd->flags |= LOOKUP_DIRECTORY | LOOKUP_FOLLOW;
+	}
+
+	/* just plain open? */
+	if (!(open_flag & O_CREAT)) {
+		/* 以nd为parent, 寻找nd->last, 结果保存在path中. */
+		error = do_lookup(nd, &nd->last, path);
+		if (error)
+			goto exit;
+		error = -ENOENT;
+		/* 文件不存在... */
+		if (!path->dentry->d_inode)
+			goto exit_dput;
+		/* i_op支持follow_link说明当前我们在处理的last是个符号链接,
+		 * 直接return NULL返回, do_filp_open()后续会通过该链接
+		 * 找到真正的文件后再重新调用do_last */
+		if (path->dentry->d_inode->i_op->follow_link)
+			return NULL;
+		error = -ENOTDIR;
+		if (nd->flags & LOOKUP_DIRECTORY) {
+			if (!path->dentry->d_inode->i_op->lookup)
+				goto exit_dput;
+		}
+		/* OK 终于找到了目标文件的dcache, 保存到nd中 */
+		path_to_nameidata(path, nd);
+		audit_inode(pathname, nd->path.dentry);
+		goto ok;
+	}
+
+	/* OK, it's O_CREAT */
+	mutex_lock(&dir->d_inode->i_mutex);
+
+	/* 
+	 * nd中保存的是parent的dentry, 和Target的qstr,
+	 * 利用这些信息可以查询dentry hash table,
+	 * 如果无法查到, 则分配一个新的dentry.
+	 */
+	path->dentry = lookup_hash(nd);
+	path->mnt = nd->path.mnt;
+
+	error = PTR_ERR(path->dentry);
+	if (IS_ERR(path->dentry)) {
+		mutex_unlock(&dir->d_inode->i_mutex);
+		goto exit;
+	}
+
+	if (IS_ERR(nd->intent.open.file)) {
+		error = PTR_ERR(nd->intent.open.file);
+		goto exit_mutex_unlock;
+	}
+
+	/* Negative dentry, just create the file */
+	/* 如果dentry的d_inode为空, 说明这个dentry对应的文件并不存在,
+	 * 需要创建. */
+	if (!path->dentry->d_inode) {
+		/*
+		 * This write is needed to ensure that a
+		 * ro->rw transition does not occur between
+		 * the time when the file is created and when
+		 * a permanent write count is taken through
+		 * the 'struct file' in nameidata_to_filp().
+		 */
+		/* 该函数的用处是通知底层文件系统,
+		 * 我们接下来会进行一个写操作... */
+		error = mnt_want_write(nd->path.mnt);
+		if (error)
+			goto exit_mutex_unlock;
+		/* 该函数会调用vfs_create, 创建一个inode与当前的dentry关联 */
+		error = __open_namei_create(nd, path, open_flag, mode);
+		if (error) {
+			mnt_drop_write(nd->path.mnt);
+			goto exit;
+		}
+		/* 保存我们来之不易的filep... */
+		filp = nameidata_to_filp(nd);
+		mnt_drop_write(nd->path.mnt);
+		if (!IS_ERR(filp)) {
+			error = ima_file_check(filp, acc_mode);
+			if (error) {
+				fput(filp);
+				filp = ERR_PTR(error);
+			}
+		}
+		return filp;
+	}
+
+	/*
+	 * It already exists.
+	 */
+	mutex_unlock(&dir->d_inode->i_mutex);
+	audit_inode(pathname, path->dentry);
+
+	error = -EEXIST;
+	if (open_flag & O_EXCL)
+		goto exit_dput;
+
+	if (__follow_mount(path)) {
+		error = -ELOOP;
+		if (open_flag & O_NOFOLLOW)
+			goto exit_dput;
+	}
+
+	error = -ENOENT;
+	if (!path->dentry->d_inode)
+		goto exit_dput;
+
+	if (path->dentry->d_inode->i_op->follow_link)
+		return NULL;
+
+	path_to_nameidata(path, nd);
+	error = -EISDIR;
+	if (S_ISDIR(path->dentry->d_inode->i_mode))
+		goto exit;
+ok:
+	/* 目标文件的dcache已经找到,
+	 * 下一步就是进一步完成struct file的初始化,
+	 * 并将struct file和dcache关联起来:
+	 * filp->f_path.dentry = nd->path.dentry */
+	filp = finish_open(nd, open_flag, acc_mode);
+	return filp;
+
+exit_mutex_unlock:
+	mutex_unlock(&dir->d_inode->i_mutex);
+exit_dput:
+	path_put_conditional(path, nd);
+exit:
+	if (!IS_ERR(nd->intent.open.file))
+		release_open_intent(nd);
+	path_put(&nd->path);
+	return ERR_PTR(error);
+}
+
+static struct file *finish_open(struct nameidata *nd,
+				int open_flag, int acc_mode)
+{
+	struct file *filp;
+	int will_truncate;
+	int error;
+
+	will_truncate = open_will_truncate(open_flag, nd->path.dentry->d_inode);
+	if (will_truncate) {
+		error = mnt_want_write(nd->path.mnt);
+		if (error)
+			goto exit;
+	}
+	error = may_open(&nd->path, acc_mode, open_flag);
+	if (error) {
+		if (will_truncate)
+			mnt_drop_write(nd->path.mnt);
+		goto exit;
+	}
+	filp = nameidata_to_filp(nd);
+	if (!IS_ERR(filp)) {
+		error = ima_file_check(filp, acc_mode);
+		if (error) {
+			fput(filp);
+			filp = ERR_PTR(error);
+		}
+	}
+	if (!IS_ERR(filp)) {
+		if (will_truncate) {
+			error = handle_truncate(&nd->path);
+			if (error) {
+				fput(filp);
+				filp = ERR_PTR(error);
+			}
+		}
+	}
+	/*
+	 * It is now safe to drop the mnt write
+	 * because the filp has had a write taken
+	 * on its behalf.
+	 */
+	if (will_truncate)
+		mnt_drop_write(nd->path.mnt);
+	return filp;
+
+exit:
+	if (!IS_ERR(nd->intent.open.file))
+		release_open_intent(nd);
+	path_put(&nd->path);
+	return ERR_PTR(error);
+}
