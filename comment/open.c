@@ -13,7 +13,7 @@ struct fdtable {
 	/* 一个数组, fd[fd] = struct file
 	 * 用来快速通过fd定位struct file */
 	struct file ** fd;      /* current fd array */
-	/* bit位, 记录了所有具有O_CLONEXEC flag的fd */
+	/* bit位, 记录了所有具有O_CLOEXEC flag的fd */
 	fd_set *close_on_exec;
 	/* bit位, 记录了所有打开的fd */
 	fd_set *open_fds;
@@ -119,7 +119,8 @@ long do_sys_open(int dfd, const char __user *filename, int flags, int mode)
 		 * 该函数其实就是调用alloc_fd(0, flags) */
 		fd = get_unused_fd_flags(flags);
 		if (fd >= 0) {
-			/* 分配一个struct file结构,
+			/* 如果是打开已经存在的文件, 这里就是找到对应的struct file,
+			 * 如果是创建文件, 就是就是分配一个新的struct file结构,
 			 * 这是一个非常非常复杂的操作... */
 			struct file *f = do_filp_open(dfd, tmp, flags, mode, 0);
 			if (IS_ERR(f)) {
@@ -198,7 +199,10 @@ repeat:
 					   fdt->max_fds, fd);
 
 	/* 如果fds_bits已经全部使用完毕, 那就是fd >= max_fds
-	 * 这时就需要扩增我们的fdt了 */
+	 * 这时就需要扩增我们的fdt了,
+	 * 扩展的方法很简单, 就是释放老的fdtable, 分配新的, 更大的fdtable
+	 * 为了避免频繁扩展带来的开销, 内核扩展是按照1024的2^N倍的量
+	 * 来增加FD的数量. */
 	error = expand_files(files, fd);
 	if (error < 0)
 		goto out;
@@ -237,3 +241,11 @@ out:
 	spin_unlock(&files->file_lock);
 	return error;
 }
+
+/*
+ * 前面的代码最终的目的就是找一个可用的fd,
+ * 内核引入了一些复杂的因素来提高效率, 其实本质
+ * 就是找一个=0的bit位而已...
+ *
+ * 下面我们进入到open()真正复杂的部分, 查找/分配一个有效的struct file结构.
+ */
