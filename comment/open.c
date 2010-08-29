@@ -13,7 +13,7 @@ struct fdtable {
 	/* 一个数组, fd[fd] = struct file
 	 * 用来快速通过fd定位struct file */
 	struct file ** fd;      /* current fd array */
-	/* bit位, 记录了所有具有O_CLONEXEC flag的fd */
+	/* bit位, 记录了所有具有O_CLOEXEC flag的fd */
 	fd_set *close_on_exec;
 	/* bit位, 记录了所有打开的fd */
 	fd_set *open_fds;
@@ -119,7 +119,8 @@ long do_sys_open(int dfd, const char __user *filename, int flags, int mode)
 		 * 该函数其实就是调用alloc_fd(0, flags) */
 		fd = get_unused_fd_flags(flags);
 		if (fd >= 0) {
-			/* 分配一个struct file结构,
+			/* 如果是打开已经存在的文件, 这里就是找到对应的struct file,
+			 * 如果是创建文件, 就是就是分配一个新的struct file结构,
 			 * 这是一个非常非常复杂的操作... */
 			struct file *f = do_filp_open(dfd, tmp, flags, mode, 0);
 			if (IS_ERR(f)) {
@@ -198,7 +199,10 @@ repeat:
 					   fdt->max_fds, fd);
 
 	/* 如果fds_bits已经全部使用完毕, 那就是fd >= max_fds
-	 * 这时就需要扩增我们的fdt了 */
+	 * 这时就需要扩增我们的fdt了,
+	 * 扩展的方法很简单, 就是释放老的fdtable, 分配新的, 更大的fdtable
+	 * 为了避免频繁扩展带来的开销, 内核扩展是按照1024的2^N倍的量
+	 * 来增加FD的数量. */
 	error = expand_files(files, fd);
 	if (error < 0)
 		goto out;
@@ -238,6 +242,75 @@ out:
 	return error;
 }
 
+/*
+ * Careful here! We test whether the file pointer is NULL before
+ * releasing the fd. This ensures that one clone task can't release
+ * an fd while another clone is opening it.
+ */
+/*
+ * open()里面分配fd, 那回收就是在close()里面了.
+ * 在open()的处理流程中, 函数get_unused_fd_flags()
+ * 它会在当前进程的fd不够用时, 扩展当前的fdtable,
+ * 但是在close时, 我们会发现, 内核并没有缩小fdtable,
+ * 也就是说fdtable在一个进程的生命期内, 是个只增不减的东东...
+ */
+SYSCALL_DEFINE1(close, unsigned int, fd)
+{
+	struct file * filp;
+	struct files_struct *files = current->files;
+	struct fdtable *fdt;
+	int retval;
+
+	spin_lock(&files->file_lock);
+	/* 获取到当前进程的fdtable,
+	 * 就是current->files->fdt. */
+	fdt = files_fdtable(files);
+	/* 如果参数fd大于我们的最大fd,
+	 * 就认为这是个无效的文件描述符 */
+	if (fd >= fdt->max_fds)
+		goto out_unlock;
+	/* 如果对应的struct file数组成员为空,
+	 * 也认为是个无效描述符. */
+	filp = fdt->fd[fd];
+	if (!filp)
+		goto out_unlock;
+	/* 这句本质就是fdt->fd[fd] = NULL
+	 * 就struct file数组对应的成员置为NULL */
+	rcu_assign_pointer(fdt->fd[fd], NULL);
+	/* 将对应的O_CLOEXEC位清除 */
+	FD_CLR(fd, fdt->close_on_exec);
+	/* 
+	 * 该函数会清掉fdt->open_fds中对应的bit位,
+	 * 并且如果fd < fdt->next_fd, 设置fdt->next_fd = fd,
+	 * 也就是说下次打开文件, 我们会优先使用上次释放的,
+	 * 最小的fd.
+	 */
+	__put_unused_fd(files, fd);
+	spin_unlock(&files->file_lock);
+	/* 回收struct file结构 */
+	retval = filp_close(filp, files);
+
+	/* can't restart close syscall because file table entry was cleared */
+	if (unlikely(retval == -ERESTARTSYS ||
+		     retval == -ERESTARTNOINTR ||
+		     retval == -ERESTARTNOHAND ||
+		     retval == -ERESTART_RESTARTBLOCK))
+		retval = -EINTR;
+
+	return retval;
+
+out_unlock:
+	spin_unlock(&files->file_lock);
+	return -EBADF;
+}
+
+/*
+ * 前面的代码最终的目的就是找一个可用的fd,
+ * 内核引入了一些复杂的因素来提高效率, 其实本质
+ * 就是找一个=0的bit位而已...
+ *
+ * 下面我们进入到open()真正复杂的部分, 查找/分配一个有效的struct file结构.
+ */
 
 /* --- 查找文件 --- */
 
