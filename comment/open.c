@@ -251,7 +251,52 @@ out:
  * 比如某个目录的dcache, 保存了它的父目录, (部分)子目录, 对应的inode结构,
  * 并且提供hash来实现快速查找.
  * 总之目前我们可以这么认为: 查找某个文件, 就是找这个文件的dcache. */
-struct dentry dentry;
+struct dentry {
+	/* 引用计数 */
+	atomic_t d_count;
+	/* ??? */
+	unsigned int d_flags;		/* protected by d_lock */
+	spinlock_t d_lock;		/* per dentry lock */
+	int d_mounted;
+	/* 对应的inode */
+	struct inode *d_inode;		/* Where the name belongs to - NULL is
+					 * negative */
+	/*
+	 * The next three fields are touched by __d_lookup.  Place them here
+	 * so they all fit in a cache line.
+	 */
+	/* hash链用于查找 */
+	struct hlist_node d_hash;	/* lookup hash list */
+	/* 父dentry */
+	struct dentry *d_parent;	/* parent directory */
+	/* 对应的目录或文件的名字 */
+	struct qstr d_name;
+
+	struct list_head d_lru;		/* LRU list */
+	/*
+	 * d_child and d_rcu can share memory
+	 */
+	union {
+		struct list_head d_child;	/* child of parent list */
+	 	struct rcu_head d_rcu;
+	} d_u;
+	/* 子dentry链表 */
+	struct list_head d_subdirs;	/* our children */
+	/* 多个dentry可能指向同一个inode, 比如硬连接.
+	 * 这种情况下, 多个dentry通过d_alias链接到inode的一个链表头上. */
+	struct list_head d_alias;	/* inode alias list */
+	/* ??? */
+	unsigned long d_time;		/* used by d_revalidate */
+	/* 由文件系统指定, 一般为NULL */
+	const struct dentry_operations *d_op;
+	struct super_block *d_sb;	/* The root of the dentry tree */
+	void *d_fsdata;			/* fs-specific data */
+
+	/* 如果对应的目录或者文件名小于DNAME_INLINE_LEN_MIN,
+	 * 则该数组用来保存文件名, 即d_name.name = d_iname.
+	 * 否则, 内核会从slab分配一段内存来保存文件名. */
+	unsigned char d_iname[DNAME_INLINE_LEN_MIN];	/* small names */
+};
 
 /* quick string
  * 该结构在内核中用来表达一个文件或者目录的名字,
@@ -648,6 +693,8 @@ exit:
 	return ERR_PTR(error);
 }
 
+/* 如果open()打开的是一个已经存在的文件,
+ * 那do_last()的最后finish_open会被调用 */
 static struct file *finish_open(struct nameidata *nd,
 				int open_flag, int acc_mode)
 {
@@ -655,20 +702,29 @@ static struct file *finish_open(struct nameidata *nd,
 	int will_truncate;
 	int error;
 
+	/* 检测flag是否设置了O_TRUNC */
 	will_truncate = open_will_truncate(open_flag, nd->path.dentry->d_inode);
 	if (will_truncate) {
+		/* 如果设置了, 通知底层文件系统我们可能会执行一个写操作,
+		 * 改变文件大小 */
 		error = mnt_want_write(nd->path.mnt);
 		if (error)
 			goto exit;
 	}
+	/* may_open里面主要是判断当前打开的文件类型,
+	 * 比如是普通文件还是设备文件,或者socket, 
+	 * 还会做一些权限验证, 等等. */
 	error = may_open(&nd->path, acc_mode, open_flag);
 	if (error) {
 		if (will_truncate)
 			mnt_drop_write(nd->path.mnt);
 		goto exit;
 	}
+	/* 除了返回我们期盼已久的filp, 还将调用__dentry_open()
+	 * 完成filp的一些初始化 */
 	filp = nameidata_to_filp(nd);
 	if (!IS_ERR(filp)) {
+		/* IMA, 可以参考: http://lwn.net/Articles/137306/ */
 		error = ima_file_check(filp, acc_mode);
 		if (error) {
 			fput(filp);
@@ -677,6 +733,7 @@ static struct file *finish_open(struct nameidata *nd,
 	}
 	if (!IS_ERR(filp)) {
 		if (will_truncate) {
+			/* 如果设置了O_TRUNC... */
 			error = handle_truncate(&nd->path);
 			if (error) {
 				fput(filp);
@@ -697,5 +754,85 @@ exit:
 	if (!IS_ERR(nd->intent.open.file))
 		release_open_intent(nd);
 	path_put(&nd->path);
+	return ERR_PTR(error);
+}
+
+static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
+					struct file *f,
+					int (*open)(struct inode *, struct file *),
+					const struct cred *cred)
+{
+	struct inode *inode;
+	int error;
+
+	f->f_mode = OPEN_FMODE(f->f_flags) | FMODE_LSEEK |
+				FMODE_PREAD | FMODE_PWRITE;
+	inode = dentry->d_inode;
+	if (f->f_mode & FMODE_WRITE) {
+		error = __get_file_write_access(inode, mnt);
+		if (error)
+			goto cleanup_file;
+		if (!special_file(inode->i_mode))
+			file_take_write(f);
+	}
+
+	f->f_mapping = inode->i_mapping;
+	f->f_path.dentry = dentry;
+	f->f_path.mnt = mnt;
+	f->f_pos = 0;
+	f->f_op = fops_get(inode->i_fop);
+	file_sb_list_add(f, inode->i_sb);
+
+	error = security_dentry_open(f, cred);
+	if (error)
+		goto cleanup_all;
+
+	if (!open && f->f_op)
+		open = f->f_op->open;
+	if (open) {
+		error = open(inode, f);
+		if (error)
+			goto cleanup_all;
+	}
+	ima_counts_get(f);
+
+	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+
+	file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping);
+
+	/* NB: we're sure to have correct a_ops only after f_op->open */
+	if (f->f_flags & O_DIRECT) {
+		if (!f->f_mapping->a_ops ||
+		    ((!f->f_mapping->a_ops->direct_IO) &&
+		    (!f->f_mapping->a_ops->get_xip_mem))) {
+			fput(f);
+			f = ERR_PTR(-EINVAL);
+		}
+	}
+
+	return f;
+
+cleanup_all:
+	fops_put(f->f_op);
+	if (f->f_mode & FMODE_WRITE) {
+		put_write_access(inode);
+		if (!special_file(inode->i_mode)) {
+			/*
+			 * We don't consider this a real
+			 * mnt_want/drop_write() pair
+			 * because it all happenend right
+			 * here, so just reset the state.
+			 */
+			file_reset_write(f);
+			mnt_drop_write(mnt);
+		}
+	}
+	file_sb_list_del(f);
+	f->f_path.dentry = NULL;
+	f->f_path.mnt = NULL;
+cleanup_file:
+	put_filp(f);
+	dput(dentry);
+	mntput(mnt);
 	return ERR_PTR(error);
 }
