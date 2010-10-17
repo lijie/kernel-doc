@@ -1,0 +1,239 @@
+
+file object
+
+之前我写文章讨论过内核如何管理fd, 提到fd的真正作用就是一个struct file数组的索引
+值, 这次我们聊一聊struct file, 它被称之为内核态的文件描述符.
+
+一个struct file表示进程打开的一个文件. 同一个文件被多个进程打开时, 会产生多个
+struct file, 进程之间不会共享(fork时CLONE_FILES不会被设置).
+
+下面是内核中struct file的定义, 取自2.6.36-rc8, include/linux/fs.h,
+为了了解file的作用, 我们逐个来分析这个结构中每个成员的意义.
+
+struct file {
+	/*
+	 * fu_list becomes invalid after file_free is called and queued via
+	 * fu_rcuhead for RCU freeing
+	 */
+	union {
+		struct list_head	fu_list;
+		struct rcu_head 	fu_rcuhead;
+	} f_u;
+	struct path		f_path;
+#define f_dentry	f_path.dentry
+#define f_vfsmnt	f_path.mnt
+	const struct file_operations	*f_op;
+	spinlock_t		f_lock;  /* f_ep_links, f_flags, no IRQ */
+#ifdef CONFIG_SMP
+	int			f_sb_list_cpu;
+#endif
+	atomic_long_t		f_count;
+	unsigned int 		f_flags;
+	fmode_t			f_mode;
+	loff_t			f_pos;
+	struct fown_struct	f_owner;
+	const struct cred	*f_cred;
+	struct file_ra_state	f_ra;
+
+	u64			f_version;
+#ifdef CONFIG_SECURITY
+	void			*f_security;
+#endif
+	/* needed for tty driver, and maybe others */
+	void			*private_data;
+
+#ifdef CONFIG_EPOLL
+	/* Used by fs/eventpoll.c to link all the hooks to this file */
+	struct list_head	f_ep_links;
+#endif /* #ifdef CONFIG_EPOLL */
+	struct address_space	*f_mapping;
+#ifdef CONFIG_DEBUG_WRITECOUNT
+	unsigned long f_mnt_write_state;
+#endif
+};
+
+fu.fu_list
+	fu_list 用来将file加入到一个链表, 表头保存在当前文件系统的超级块中.
+
+f_sb_list_cpu
+	cupid, 上面提到sb_block的一个链表, 是per-cpu的, 这个cpuid用来保存当前的
+	file是被链到哪个CPU上的.
+
+f_path
+	f_path 保存了当前file对应的dentry和mount_point. 内核用这个数据结构描述文
+	件在文件目录结构中所处的位置.
+
+f_op
+	把struct file看做一个类的话, f_op可以看作是它的成员函数了, 而且还是虚函
+	数, 具体的实现由特定的文件系统(或者驱动)来完成.
+
+f_count
+	引用计数, 为0表示当前的file可以被free
+
+f_flags
+	一般是open()系统调用的第二个参数
+
+f_mode
+	一般是open()系统调用的第三个参数
+
+f_pos
+	当前的文件偏移量, lseek()系统调用就是用来修改这个值的.
+
+f_owner
+	保存uid, euid, pid等等...
+
+f_cred
+	The security context of a task
+
+f_ra
+	用于文件预读
+
+f_version
+	版本号
+
+private_data
+	这个东东, 写过字符设备驱动的同学肯定很熟悉...
+
+f_ep_links
+	用于epoll
+
+f_mapping
+	用于管理 page cache
+
+
+struct file 的初始化
+
+虽然file结构不复杂, 但包含的内容也比较多样, 除了被打开文件的一些基本属性: 路径
+(f_path) 文件偏移(f_pos) flags(f_flags, 读, 写, 创建等等) mode(f_mode, 比如
+0666). 还包含一些比较晦涩的东西 比如f_cred和f_security, 用于安全方面. f_ra 用于
+文件预读技术等等.
+
+从代码角度看, do_filp_open()函数包含了struct file的完整的初始化流程, 包含以下几
+个步骤:
+
+1. 首先调用 get_empty_filp() 获得一个"空"的 struct file, 如下面的代码所示:
+struct file *get_empty_filp(void)
+{
+...
+	/* 从slab分配一个file */
+	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
+	if (f == NULL)
+		goto fail;
+
+	/* 初始化链表 */
+	INIT_LIST_HEAD(&f->f_u.fu_list);
+	/* 设置引用计数为1 */
+	atomic_long_set(&f->f_count, 1);
+	/* 初始化f_owner的读写锁 */
+	rwlock_init(&f->f_owner.lock);
+	/* 初始化f_cred */
+	f->f_cred = get_cred(cred);
+	/* 初始化自旋锁 */
+	spin_lock_init(&f->f_lock);
+	eventpoll_init_file(f);
+	/* f->f_version: 0 */
+	return f;
+....
+}
+get_emtpy_file()分配一个file结构并完成最基本的初始化, 填入的数据还没有跟任何真正
+的文件关联起来.
+
+2. 将open_flags(即用户通过系统调用open传入的第二个参数)赋值给file->f_flags
+
+3. 在do_last()中完成对file的最后初始化, 因为内核此时已经找到了要打开的文件, 并获
+得了指定文件的dentry和inode, 内核会从这2个结构中copy部分数据给file.
+
+do_last() -> nameidata_to_filp() -> __dentry_open()
+
+static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
+					struct file *f,
+					int (*open)(struct inode *, struct file *),
+					const struct cred *cred)
+{
+	struct inode *inode;
+	int error;
+
+	/* 给f_mode赋值 */
+	f->f_mode = OPEN_FMODE(f->f_flags) | FMODE_LSEEK |
+				FMODE_PREAD | FMODE_PWRITE;
+	inode = dentry->d_inode;
+	/* 初始化多个成员变量... */
+	/* f_mapping 实际是从inode那里copy过来的 */
+	f->f_mapping = inode->i_mapping;
+	f->f_path.dentry = dentry;
+	f->f_path.mnt = mnt;
+	f->f_pos = 0;
+	/* f_op 实际是从inode那里copy过来的 */
+	f->f_op = fops_get(inode->i_fop);
+	file_sb_list_add(f, inode->i_sb);
+
+	/* 这里执行文件系统(或者驱动)指定的open函数 */
+	if (!open && f->f_op)
+		open = f->f_op->open;
+	if (open) {
+		error = open(inode, f);
+		if (error)
+			goto cleanup_all;
+	}
+
+	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+	/* 初始化文件预读 */
+	file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping);
+
+	/* NB: we're sure to have correct a_ops only after f_op->open */
+	if (f->f_flags & O_DIRECT) {
+		if (!f->f_mapping->a_ops ||
+		    ((!f->f_mapping->a_ops->direct_IO) &&
+		    (!f->f_mapping->a_ops->get_xip_mem))) {
+			fput(f);
+			f = ERR_PTR(-EINVAL);
+		}
+	}
+
+	return f;
+...
+}
+
+4. do_last() 完成后, do_filp_open()返回到sys_open, sys_open()会将得到的file结构和之
+   前分配的fd关联起来, 这样就完成了整个的open系统调用.
+
+完成file的初始化之前, 必须找到对于文件的dentry和inode, 这2个数据结果在VFS中也是
+非常重要的, 我会在以后的文章中详细聊聊.
+
+得到struct file后我们能干什么
+
+这句的意思就是f_op能干什么, 因为f_op是file的成员函数集. 为了回答这个问题, 我们可
+以看下f_op这个结构的定义:
+struct file_operations {
+	struct module *owner;
+	loff_t (*llseek) (struct file *, loff_t, int);
+	ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+	ssize_t (*aio_read) (struct kiocb *, const struct iovec *, unsigned long, loff_t);
+	ssize_t (*aio_write) (struct kiocb *, const struct iovec *, unsigned long, loff_t);
+	int (*readdir) (struct file *, void *, filldir_t);
+	unsigned int (*poll) (struct file *, struct poll_table_struct *);
+	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
+	int (*mmap) (struct file *, struct vm_area_struct *);
+	int (*open) (struct inode *, struct file *);
+	int (*flush) (struct file *, fl_owner_t id);
+	int (*release) (struct inode *, struct file *);
+	int (*fsync) (struct file *, int datasync);
+	int (*aio_fsync) (struct kiocb *, int datasync);
+	int (*fasync) (int, struct file *, int);
+	int (*lock) (struct file *, int, struct file_lock *);
+	ssize_t (*sendpage) (struct file *, struct page *, int, size_t, loff_t *, int);
+	unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+	int (*check_flags)(int);
+	int (*flock) (struct file *, int, struct file_lock *);
+	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
+	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+	int (*setlease)(struct file *, long, struct file_lock **);
+};
+
+上面这些函数指针有很多你看起来应该非常眼熟, 事实上许多文件系统方面的系统调用确实
+就是通过file->f_op->xxx来完成的.
+
+而f_op其实是从inode->i_op copy过来的, 可见真正要了解这些系统调用, 我们还需要对
+inode做深入的分析.
