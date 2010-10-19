@@ -71,10 +71,13 @@ f_count
 	引用计数, 为0表示当前的file可以被free
 
 f_flags
-	一般是open()系统调用的第二个参数
+	一般是open()系统调用的第二个参数, 但是内核会根据实际情况修改它. 比如如果
+	文件已经存在,内核就会clear掉O_CREAT等等.
 
 f_mode
-	一般是open()系统调用的第三个参数
+	它*不是*是open()系统调用的第三个参数! f_mode可以看作是指定文件打开以后可
+	以用来做什么, 除了读写权限是copy自f_flags, 其它bit内核会根据实际情况设置,
+	相信可以参考fs.h中的FMODE_*一族宏.
 
 f_pos
 	当前的文件偏移量, lseek()系统调用就是用来修改这个值的.
@@ -104,9 +107,8 @@ f_mapping
 struct file 的初始化
 
 虽然file结构不复杂, 但包含的内容也比较多样, 除了被打开文件的一些基本属性: 路径
-(f_path) 文件偏移(f_pos) flags(f_flags, 读, 写, 创建等等) mode(f_mode, 比如
-0666). 还包含一些比较晦涩的东西 比如f_cred和f_security, 用于安全方面. f_ra 用于
-文件预读技术等等.
+(f_path) 文件偏移(f_pos) flags(f_flags, 读, 写, 创建等等). 还包含一些比较晦涩的东
+西 比如f_cred和f_security, 用于安全方面. f_ra 用于文件预读技术等等.
 
 从代码角度看, do_filp_open()函数包含了struct file的完整的初始化流程, 包含以下几
 个步骤:
@@ -140,10 +142,11 @@ get_emtpy_file()分配一个file结构并完成最基本的初始化, 填入的�
 
 2. 将open_flags(即用户通过系统调用open传入的第二个参数)赋值给file->f_flags
 
-3. 在do_last()中完成对file的最后初始化, 因为内核此时已经找到了要打开的文件, 并获
-得了指定文件的dentry和inode, 内核会从这2个结构中copy部分数据给file.
+3. 在do_last() -> (finish_open()) -> nameidata_to_filp() -> __dentry_open()中完成
+对file的最后初始化, 因为内核此时已经找到了要打开的文件, 并获得了指定文件的dentry
+和inode, 内核会从这2个结构中copy部分数据给file.
 
-do_last() -> nameidata_to_filp() -> __dentry_open()
+* 如果文件是新创建的, finish_open() 不会被执行.
 
 static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
 					struct file *f,
@@ -194,7 +197,7 @@ static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
 ...
 }
 
-4. do_last() 完成后, do_filp_open()返回到sys_open, sys_open()会将得到的file结构和之
+4. do_last() 完成后, do_filp_open()返回到do_sys_open, do_sys_open()会将得到的file结构和之
    前分配的fd关联起来, 这样就完成了整个的open系统调用.
 
 完成file的初始化之前, 必须找到对于文件的dentry和inode, 这2个数据结果在VFS中也是
@@ -235,5 +238,5 @@ struct file_operations {
 上面这些函数指针有很多你看起来应该非常眼熟, 事实上许多文件系统方面的系统调用确实
 就是通过file->f_op->xxx来完成的.
 
-而f_op其实是从inode->i_op copy过来的, 可见真正要了解这些系统调用, 我们还需要对
-inode做深入的分析.
+而f_op其实是从inode->i_op copy过来的, 另外 f_mapping 这个非常重要的成员, 用来管理
+PageCache, 也取自inode. 可见真正要了解VFS, 我们还需要对inode做深入的分析.
