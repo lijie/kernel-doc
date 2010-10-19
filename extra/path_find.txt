@@ -10,22 +10,205 @@ ext2的实现细节, 也可以想象对于一个长长的路径来说, 目录和
 
 本文就是要讨论VFS这套cache机制: dcache
 
-路径拆分
+相关数据结构
 
 我们以/home/andrewli/test/a.c 这个路径作为例子, 引入内核dcache中使用的一些数据结
 构.
 
-首先, 路径是个层次结构, 找到andrewli这个目录的前提是首先要找到home, 根据这个特性
-我们可以知道 知道子目录的必要条件有2个:
+首先, 路径是个层次结构, 这里共有/, home, andrewli, test, a.c5个层次, 找到
+andrewli这个目录的前提是首先要找到home, 根据这个特性我们可以知道 找到子目录的必要
+条件有2个:
 1. 你找到了父目录
 2. 你知道子目录的名字
 
-有一个例外就是第一次层, 也就是根目录"/", 它没有父目录, 找到它是通过其它手段.
+有一个例外就是第一层次, 也就是根目录"/", 它没有父目录, 找到它是通过其它手段.
 
-这个路径可以被拆为5个项:
-其中4个目录1个普通文件: /, home, andrewli, test, a.c
-内核使用struct dentry数据结构来描述上面中的任一项,
+为了描述路径的这种层次结构和查找特性, 内核引入了struct dentry, 每个dentry可以看作
+路径中的一个层次, 每个dentry可以直接找到自己的parent dentry, 也可以通过名字找到对
+应的child dentry. 因为dentry是一种cache机制, 完全为了性能而存在, 所以它也有一套
+LRU的淘汰机制.
 
-其中根目录"/"是个非常特殊的部分, 因为它是路径查找的起始点.
+另外, 为了方便的处理文件名, 内核引入了一个struct qstr的数据结构, 全称是quick
+string, 其实就是它除了保存文件名本身外, 还保存了字符串的长度和hash值.
 
+hash是dcache所使用的重要技术手段, 查找一个dentry的过程其实就是一个查hash表的过程,
+后面我们会讲到.
 
+OK 我们来看下dentry的具体实现, 逐个解释下每个成员的意义:
+
+struct dentry {
+	atomic_t d_count;
+	unsigned int d_flags;		/* protected by d_lock */
+	spinlock_t d_lock;		/* per dentry lock */
+	int d_mounted;
+	struct inode *d_inode;		/* Where the name belongs to - NULL is
+					 * negative */
+	/*
+	 * The next three fields are touched by __d_lookup.  Place them here
+	 * so they all fit in a cache line.
+	 */
+	struct hlist_node d_hash;	/* lookup hash list */
+	struct dentry *d_parent;	/* parent directory */
+	struct qstr d_name;
+
+	struct list_head d_lru;		/* LRU list */
+	/*
+	 * d_child and d_rcu can share memory
+	 */
+	union {
+		struct list_head d_child;	/* child of parent list */
+	 	struct rcu_head d_rcu;
+	} d_u;
+	struct list_head d_subdirs;	/* our children */
+	struct list_head d_alias;	/* inode alias list */
+	unsigned long d_time;		/* used by d_revalidate */
+	const struct dentry_operations *d_op;
+	struct super_block *d_sb;	/* The root of the dentry tree */
+	void *d_fsdata;			/* fs-specific data */
+
+	unsigned char d_iname[DNAME_INLINE_LEN_MIN];	/* small names */
+};
+
+d_count
+	引用计数, 为0时表示当前的dentry没有被使用
+
+d_flags
+	dcache的一些标志位, 详情可以参考 dcache.h DCACHE_*一族宏.
+
+d_lock
+	保护dentry的自旋锁
+
+d_mounted
+	当前dentry是否是一个挂载点(mountpoint)
+
+d_inode
+	与当前dentry关联的实际文件, 非常终要的东东
+
+d_hash
+	hash chain, 非常重要的成员, dentry的hash查找需要用到.
+	
+d_parent
+	当前dentry的父dentry
+
+d_name
+	当前dentry对应的文件的文件名
+
+d_lru
+	lru 链表, 淘汰用
+
+d_u.d_child
+	与d_subdirs成对使用的list_head结构.
+
+d_subdirs
+	当前dentry的子dentry都链到这个链表, 不过这里必须注意, 这个链表不一定包含
+	当前dentry的所有子dentry, 因为dentry是一种cache, 有可能会被淘汰掉.
+
+d_alias
+	list_head, 所有关联同一个inode的dentry都会链在一起, 表头在
+	inode->i_dentry. 为什么会存在多个dentry指向同一个inode? 因为有硬连接的存
+	在, 硬连接文件在不同的路径, 但是它们实际是同一个物理文件, 也就是同一个inode.
+
+d_time
+	dcache本身似乎没使用这个值, 注释中说到 d_op->d_revalidate 方法会使用这个
+	值, 但其实实现了 d_revalidate 的文件系统不多...
+
+d_op
+	由特定文件系统实现的一组操作, 类似file->f_op, 不过d_op的功能很少, 主要是实现
+	特定文件系统对dcache的定制. 事实上实现了d_op的文件系统不多.
+
+d_sb
+	指向当前文件系统的super_block
+
+d_fsdata
+	文件系统的私有数据, dcache本身不使用.
+
+d_iname
+	d_iname 是为了节约内存而设计的, dentry为了高效是cacheline对齐的, x86的
+	cacheline一般是64字节, DNAME_INLINE_LEN_MIN其实就是dentry对齐后的padding
+	字节数, 不用也是浪费, 于是当文件名的长度小于DNAME_INLINE_LEN_MIN时,
+	内核会使用这个数组来保存文件名字符串, 否则内核会通过slab分配新的内存块来
+	存储文件名. 在64bit系统中, 这个长度是32B.
+
+dentry的初始化
+
+dentry的初始化分为2个大的步骤, 首先调用dcache.c中的d_alloc()分配一个空的dentry,
+完成最基本的初始化, 然后在调用特定文件系统的lookup(比如 ext2_lookup), 完成dentry
+与inode的关联. 与路径层次的特性一样, dentry的初始化必须用到父dentry和当前dentry
+对应的文件名.
+
+上代码, 虽然这个函数很长, 但原理非常简单.
+struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
+{
+	struct dentry *dentry;
+	char *dname;
+
+	/* 分配新的dentry */
+	dentry = kmem_cache_alloc(dentry_cache, GFP_KERNEL);
+	if (!dentry)
+		return NULL;
+
+	/* 根据文件名的长度来判断是否需要分配新的空间来保存文件名 */ 
+	if (name->len > DNAME_INLINE_LEN-1) {
+		dname = kmalloc(name->len + 1, GFP_KERNEL);
+		if (!dname) {
+			kmem_cache_free(dentry_cache, dentry); 
+			return NULL;
+		}
+	} else  {
+		dname = dentry->d_iname;
+	}	
+	dentry->d_name.name = dname;
+
+	/* 保存qstr */ 
+	dentry->d_name.len = name->len;
+	dentry->d_name.hash = name->hash;
+	memcpy(dname, name->name, name->len);
+	dname[name->len] = 0;
+
+	/* 下面就是一系列最基本的初始化了... */ 
+	atomic_set(&dentry->d_count, 1);
+	dentry->d_flags = DCACHE_UNHASHED;
+	spin_lock_init(&dentry->d_lock);
+	dentry->d_inode = NULL;
+	dentry->d_parent = NULL;
+	dentry->d_sb = NULL;
+	dentry->d_op = NULL;
+	dentry->d_fsdata = NULL;
+	dentry->d_mounted = 0;
+	INIT_HLIST_NODE(&dentry->d_hash);
+	INIT_LIST_HEAD(&dentry->d_lru);
+	INIT_LIST_HEAD(&dentry->d_subdirs);
+	INIT_LIST_HEAD(&dentry->d_alias);
+
+	/* 从parent那里copy superblock, 增加parent的引用计数 */ 
+	if (parent) {
+		dentry->d_parent = dget(parent);
+		dentry->d_sb = parent->d_sb;
+	} else {
+		INIT_LIST_HEAD(&dentry->d_u.d_child);
+	}
+
+	/* 这个锁似乎有点重... 
+	 * 为什么不是nr_dentry使用atomic_t类型, 而这里只要锁parent->d_lock 就好? */
+	spin_lock(&dcache_lock);
+	/* 加入到parent的链表中 */
+	if (parent)
+		list_add(&dentry->d_u.d_child, &parent->d_subdirs);
+	dentry_stat.nr_dentry++;
+	spin_unlock(&dcache_lock);
+
+	return dentry;
+}
+
+特定文件系统的lookup, 这里我们选了btrfs这个时髦的文件系统来看, 反正不不深究它的具体实现...
+static struct dentry *btrfs_lookup(struct inode *dir, struct dentry *dentry,
+				   struct nameidata *nd)
+{
+	struct inode *inode;
+
+	inode = btrfs_lookup_dentry(dir, dentry);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
+
+	return d_splice_alias(inode, dentry);
+}
