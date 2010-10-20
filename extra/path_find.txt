@@ -131,10 +131,10 @@ d_iname
 
 dentry的初始化
 
-dentry的初始化分为2个大的步骤, 首先调用dcache.c中的d_alloc()分配一个空的dentry,
-完成最基本的初始化, 然后在调用特定文件系统的lookup(比如 ext2_lookup), 完成dentry
-与inode的关联. 与路径层次的特性一样, dentry的初始化必须用到父dentry和当前dentry
-对应的文件名.
+dentry的初始化分为2个大的步骤:
+首先调用dcache.c中的d_alloc()分配一个空的dentry, 完成最基本的初始化.
+然后在调用特定文件系统的lookup(比如 ext2_lookup), 完成dentry与inode的关联.
+与路径层次的特性一样, dentry的初始化必须用到父dentry和当前dentry对应的文件名.
 
 上代码, 虽然这个函数很长, 但原理非常简单.
 struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
@@ -176,6 +176,8 @@ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
 	dentry->d_fsdata = NULL;
 	dentry->d_mounted = 0;
 	INIT_HLIST_NODE(&dentry->d_hash);
+
+	/* 新分配的dentry还没有加入到lru队列中 */
 	INIT_LIST_HEAD(&dentry->d_lru);
 	INIT_LIST_HEAD(&dentry->d_subdirs);
 	INIT_LIST_HEAD(&dentry->d_alias);
@@ -200,15 +202,215 @@ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
 	return dentry;
 }
 
-特定文件系统的lookup, 这里我们选了btrfs这个时髦的文件系统来看, 反正不不深究它的具体实现...
+特定文件系统的lookup, 这里我们选了btrfs这个时髦的文件系统来看, 反正不不深究它的具
+体实现...
+dir 是父dentry对应的inode
+dentry 是我们要初始化的dentry
+nd 这个讨厌的数据结构你可以忽略
 static struct dentry *btrfs_lookup(struct inode *dir, struct dentry *dentry,
 				   struct nameidata *nd)
 {
 	struct inode *inode;
 
+	/* 这里会找到当前dentry对应的inode */
 	inode = btrfs_lookup_dentry(dir, dentry);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
 
+	/* 在这里将找到的inode跟dentry关联 */
 	return d_splice_alias(inode, dentry);
 }
+
+我们现在有了分配好的dentry, 也根据文件名找到了对应的inode, 剩下的关联动作由函数
+d_splice_alias() 完成.
+
+关联有下面2个步骤:
+
+第一步, 数据复制, 让dentry可以找到对应的inode.
+static void __d_instantiate(struct dentry *dentry, struct inode *inode)
+{
+	if (inode)
+		list_add(&dentry->d_alias, &inode->i_dentry);
+	dentry->d_inode = inode;
+	fsnotify_d_instantiate(dentry, inode);
+}
+
+第二步, hash
+
+hash的步骤跟路径层次特性是相关的, 首先调用d_hash()函数,
+需要传入2个参数, 首先是parent的dentry, 然后是当前文件名的hash值:
+hlist = d_hash(dentry->d_parent, entry->d_name.hash)
+
+这样会得到hlist, 它是一个hash链表头, 意思是当前的dentry经过hash后, 可以插入到全
+局hash表的哪个位置.
+
+接着, 清除UNHASED标志位, 说明当前的dentry即将插入到hash表中
+dentry->d_flags &= ~DCACHE_UNHASHED;
+然后放入到hash链的表头
+hlist_add_head_rcu(&entry->d_hash, hlist);
+
+我在这里要强调2点:
+1. 文件名的hash值和dentry使用的hash表是2个hash概念, 不要搞混.
+2. 当前dentry的hash结果取决于parent dentry和当前文件名的hash值, 所以我一直强调
+dentry是符合路径层次特性的, 只有在parent和文件名已知的情况下, 你才能得到当前dentry.
+
+
+dentry的全局hash表
+
+dcache维护了一个大大的hash表, 所有分配并初始化成功的dentry都在里面, 除了"/"的
+dentry. 每一项都是一个长长的hash链, hash值相同的dentry都会链到同一个hash链上. 所
+以正如我之前所说, 查找dentry的过程就是一个查hash表的过程.
+
+举例说明, 我们已经找到了home的dentry, 如何找它的子目录andrewli呢?
+
+首先构造一个 qstr:
+qstr->name = "andrewli"
+qstr->len  = 8
+qstr->hash = XX (经过计算后的hash值)
+然后找到hash链
+hlist = d_hash(dentry_of_home, qstr->hash)
+然后遍历整个hlist, 通过比较qstr->hash和qstr->name的办法找到andrewli的dentry.
+
+遍历hash链是调用d_lookup()实现的, 我们看代码:
+struct dentry * __d_lookup(struct dentry * parent, struct qstr * name)
+{
+	unsigned int len = name->len;
+	unsigned int hash = name->hash;
+	const unsigned char *str = name->name;
+
+	/* 在这里计算出head, 就是我们需要的hash链 */
+	struct hlist_head *head = d_hash(parent,hash);
+	struct dentry *found = NULL;
+	struct hlist_node *node;
+	struct dentry *dentry;
+
+	rcu_read_lock();
+	
+	/* 遍历之前找到的hash链 */
+	hlist_for_each_entry_rcu(dentry, node, head, d_hash) {
+		struct qstr *qstr;
+
+		/* qstr->hash 值不匹配 */
+		if (dentry->d_name.hash != hash)
+			continue;
+		/* hash值一样 但不在同一个目录 */
+		if (dentry->d_parent != parent)
+			continue;
+
+		spin_lock(&dentry->d_lock);
+
+		/*
+		 * Recheck the dentry after taking the lock - d_move may have
+		 * changed things.  Don't bother checking the hash because we're
+		 * about to compare the whole name anyway.
+		 */
+		if (dentry->d_parent != parent)
+			goto next;
+
+		/* non-existing due to RCU? */
+		if (d_unhashed(dentry))
+			goto next;
+
+		/*
+		 * It is safe to compare names since d_move() cannot
+		 * change the qstr (protected by d_lock).
+		 */
+		qstr = &dentry->d_name;
+
+		/* 我们找到了一个qstr->hash值一致, 也在同一个目录的dentry
+		 * 为了进一步确认这个dentry就是我们的目标, 需要做最后的比较 */
+		if (parent->d_op && parent->d_op->d_compare) {
+			if (parent->d_op->d_compare(parent, qstr, name))
+				goto next;
+		} else {
+		        /* 绝大多数文件系统都是有了dcache默认的比较方法
+			 * 那就是比较文件名的长度和实际内容是否完全一致 */
+			if (qstr->len != len)
+				goto next;
+			if (memcmp(qstr->name, str, len))
+				goto next;
+		}
+
+		/* 找到了... */
+		atomic_inc(&dentry->d_count);
+		found = dentry;
+		spin_unlock(&dentry->d_lock);
+		break;
+next:
+		spin_unlock(&dentry->d_lock);
+ 	}
+ 	rcu_read_unlock();
+
+ 	return found;
+}
+
+hash 算法
+
+我认为hash算法是个纯数学问题, 无非就是让分布更均匀之类.
+贴贴代码感受一下吧, 反正我看不懂...
+
+qstr->hash的计算方法大致如下:
+hash = 0;
+do {
+	name++;
+	hash = (hash + (c << 4) + (c >> 4)) * 11;
+	c = *(const unsigned char *)name;
+} while (c && (c != '/'));
+qstr.len = name - (const char *) qstr.name;
+qstr.hash = hash
+
+d_hash的实现就比较晦涩:
+/* 2^31 + 2^29 - 2^25 + 2^22 - 2^19 - 2^16 + 1 */
+#define GOLDEN_RATIO_PRIME_32 0x9e370001UL
+/*  2^63 + 2^61 - 2^57 + 2^54 - 2^51 - 2^18 + 1 */
+#define GOLDEN_RATIO_PRIME_64 0x9e37fffffffc0001UL
+#define	L1_CACHE_BYTES 64
+
+static inline struct hlist_head *d_hash(struct dentry *parent,
+					unsigned long hash)
+{
+	hash += ((unsigned long) parent ^ GOLDEN_RATIO_PRIME) / L1_CACHE_BYTES;
+	hash = hash ^ ((hash ^ GOLDEN_RATIO_PRIME) >> D_HASHBITS);
+	return dentry_hashtable + (hash & D_HASHMASK);
+}
+
+dentry的分配和查找, 大致就是这样, 现在的问题是最开始就提出的问题,
+"/" 目录没有parent, 或者说parent就是它自己, 我们这么找到它?
+
+除了"/", 还一个特殊的dentry不是那么容易找到, 那就是CWD(current work
+directory). 这2个特殊的dentry往往就是路径查找的起始位置, 对于起始位置, 内核提供
+了一些简单的办法来获取:
+
+你总是可以这样得到root和cwd的dentry:
+current->fs->root->dentry
+current->fs->pwd->dentry
+这2个dentry在current进程启动, 或者相关系统调用发生时被内核设置.
+
+回到我们最初的问题:
+open("/home/andrewli/test/a.c", ...)
+
+现在我们可以总结内核寻找a.c的步骤了:
+1. 获取current->fs->root->dentry
+2. 构造qstr of home
+3. dentry_of_home = d_lookup(dentry_of_root, qstr_of_home)
+4. d_lookup返回空, 表示dentry不存在, 调用 dentry_of_home =
+d_alloc(dentry_of_root, qstr_of_home)
+5. 调用dentry_of_root->d_inode->i_op->lookup(dentry_of_root, dentry_of_home)关联
+dentry和inode
+6. 反复执行2,3,4,5步, 直到找到dentry_of_a.c
+7. dentry_of_a.c->d_inode 就是我们要找的文件了!
+
+
+dcache的淘汰
+
+dcache的淘汰使用了内核的shrink机制, 简单的说, 就是内核觉得要回收一些内存时,
+dcache注册到shrink subsystem的回调函数shrink_dcache_memory()会被执行.
+
+shrink_dcache_memory() 的作用是遍历每个super_block的每一个dcache_lru链表, 逐个释
+放直到满足内核的需要.
+
+dentry分配后是不会被直接放到lru队列里面去的, 只有dput(dentry)被调用后, 比如:
+close(fd) -> filp_close(filp) -> fput(filp) -> dput(dentry) ...
+关闭一个文件会让dentry引用计数减1, 为0后, 该dentry就进入lru队列, 但不会立即从全
+局hash表里清除掉, 也就是说 引用计数为0后, 只要shrink机制没有被触发, 处于lru队列
+的dentry仍然有可能被内核找到并使用.
